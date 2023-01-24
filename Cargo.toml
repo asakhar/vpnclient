@@ -1,0 +1,14 @@
+[package]
+name = "vpnclient"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+openssl = "0.10.45"
+rmce = { version = "0.1.0", path = "../rmce" }
+tokio = { version = "1.24.2", features = ["net", "macros", "rt-multi-thread", "io-util"] }
+
+[profile.dev.package."rmce"]
+opt-level = 2
