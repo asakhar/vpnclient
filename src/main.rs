@@ -4,15 +4,14 @@ use std::sync::Arc;
 
 use qprov::Certificate;
 
+use clap::Parser;
 use qprov::sized_read_writes::{ReadSizedExt, WriteSizedExt};
 use qprov::{PqsChannel, PqsContext};
 use wintun::Adapter;
-use clap::Parser;
 
 fn main() {
   let cli = Cli::parse();
-  let wintun = unsafe { wintun::load_from_path(cli.libpath) }
-    .expect("Failed to load wintun dll");
+  let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
   let adapter = match Adapter::open(&wintun, &cli.iface_name) {
     Ok(a) => a,
     Err(_) => {
@@ -32,6 +31,9 @@ fn main() {
   let mut internal_ip_bytes = [0u8; 4];
   stream.read_exact(&mut internal_ip_bytes).unwrap();
   println!("received ip: {:?}", internal_ip_bytes);
+  stream
+    .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+    .unwrap();
 
   set_ip_address(&adapter, internal_ip_bytes).unwrap();
   println!("ip successfully set");
