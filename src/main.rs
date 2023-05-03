@@ -110,39 +110,35 @@ fn handshake(
   let PlainMessage::Hello(server_hello) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
   };
+  if !server_hello.chain.verify(&ca_cert, certificate_verificator) {
+    return Err(Box::new(std::io::Error::new(
+      ErrorKind::InvalidInput,
+      "Failed to authorize servers certificate",
+    )));
+  }
   // ======== !SERVER HELLO
 
-  // ======== PREMASTER
-  let (encapsulated, premaster) =
+  // ======== SERVER PREMASTER
+  let (encapsulated, server_premaster) =
     KeyType::encapsulate(&server_hello.chain.get_target().contents.pub_keys);
   let message = PlainMessage::Premaster(encapsulated);
   send_guaranteed(socket, message, buffer.as_mut_slice())?;
-  // ======== !PREMASTER
+  // ======== !SERVER PREMASTER
+
+  // ======== CLIENT PREMASTER
+  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let PlainMessage::Premaster(encapsulated) = message else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
+  };
+  let client_premaster = KeyType::decapsulate(secret_key, &encapsulated);
+  // ======== !CLIENT PREMASTER
 
   // ======== KEY DERIVATION
-  let derived_key = client_hello.random ^ server_hello.random ^ premaster;
-  let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(client_hello.random));
-  let expected_hash = KeyType::zero(); // TODO: compute hashes
-                                       // ======== !KEY DERIVATION
+  let derived_key = client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
+  let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_hello.random));
+  let hash = KeyType::zero(); // TODO: compute hashes
 
-  // ======== SERVER READY
-  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
-  let PlainMessage::Ready(encrypted) = message else {
-    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during ready")));
-  };
-  let decrypted = encrypted
-    .decrypt(&mut crypter)
-    .expect("Failed to decrypt server hello");
-  let DecryptedMessage::Ready { hash } = decrypted else {
-    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during ready inside encrypted")))
-  };
-  if !compare_hashes(expected_hash, hash) {
-    return Err(Box::new(std::io::Error::new(
-      ErrorKind::InvalidData,
-      "Hashes did not match",
-    )));
-  }
-  // ======== !SERVER READY
+  // ======== !KEY DERIVATION
 
   // ======== CLIENT READY
   let encrypted = DecryptedMessage::Ready { hash }.encrypt(&mut crypter);
