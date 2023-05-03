@@ -32,22 +32,24 @@ fn main() {
   let chain = CertificateChain::from_file(&cli.certificate_chain_file).unwrap();
   let secret_key = SecKeyPair::from_file(cli.secret_key_file).unwrap();
 
-  let ip = handshake(&mut socket, &secret_key, &ca_cert, &chain).unwrap();
-  println!("received ip: {ip}");
+  let (ip, mask) = handshake(&mut socket, &secret_key, &ca_cert, &chain).unwrap();
+  println!("received ip: {ip}/{mask}");
 
-  // let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
-  // let adapter = match Adapter::open(&wintun, &cli.iface_name) {
-  //   Ok(a) => a,
-  //   Err(_) => {
-  //     //If loading failed (most likely it didn't exist), create a new one
-  //     wintun::Adapter::create(&wintun, &cli.iface_pool, &cli.iface_name, None)
-  //       .expect("Failed to create wintun adapter!")
-  //   }
-  // };
-  // set_ip_address(&adapter, internal_ip_bytes).unwrap();
-  // println!("ip successfully set");
-  // //Specify the size of the ring buffer the wintun driver should use.
-  // let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+  let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
+  let adapter = match Adapter::open(&wintun, &cli.iface_name) {
+    Ok(a) => a,
+    Err(_) => {
+      //If loading failed (most likely it didn't exist), create a new one
+      wintun::Adapter::create(&wintun, &cli.iface_pool, &cli.iface_name, None)
+        .expect("Failed to create wintun adapter!")
+    }
+  };
+  set_ip_address(&adapter, ip, mask).unwrap();
+
+  println!("ip successfully set");
+  //Specify the size of the ring buffer the wintun driver should use.
+  let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+  loop {}
   // let mut poll = mio::Poll::new().unwrap();
   // let registry = poll.registry();
   // registry.register(&mut socket, SOCK, mio::Interest::READABLE);
@@ -92,7 +94,7 @@ fn handshake(
   secret_key: &SecKeyPair,
   ca_cert: &Certificate,
   chain: &CertificateChain,
-) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+) -> Result<(Ipv4Addr, u8), Box<dyn std::error::Error>> {
   let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
 
   // ======== CLIENT HELLO
@@ -153,15 +155,15 @@ fn handshake(
   let decrypted = encrypted
     .decrypt(&mut crypter)
     .expect("Failed to decrypt server hello");
-  let DecryptedMessage::Welcome{ip} = decrypted else {
+  let DecryptedMessage::Welcome{ip, mask} = decrypted else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")))
   };
   // ======== !SERVER WELCOME
 
-  Ok(ip)
+  Ok((ip, mask))
 }
 
-fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: [u8; 4]) -> std::io::Result<()> {
+fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: Ipv4Addr, mask: u8) -> std::io::Result<()> {
   let mut address_row = winapi::shared::netioapi::MIB_UNICASTIPADDRESS_ROW::default();
   unsafe {
     winapi::shared::netioapi::InitializeUnicastIpAddressEntry(&mut address_row as *mut _);
@@ -172,9 +174,9 @@ fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: [u8; 4]) -> std::io::Resu
   unsafe {
     let ipv4 = address_row.Address.Ipv4_mut();
     ipv4.sin_family = winapi::shared::ws2def::AF_INET as _;
-    *ipv4.sin_addr.S_un.S_addr_mut() = u32::from_ne_bytes(internal_ip);
+    *ipv4.sin_addr.S_un.S_addr_mut() = u32::from_ne_bytes(internal_ip.octets());
   }
-  address_row.OnLinkPrefixLength = 24;
+  address_row.OnLinkPrefixLength = mask;
   address_row.DadState = winapi::shared::nldef::IpDadStatePreferred;
   let error =
     unsafe { winapi::shared::netioapi::CreateUnicastIpAddressEntry(&mut address_row as *mut _) };
