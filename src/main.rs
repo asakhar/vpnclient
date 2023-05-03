@@ -1,18 +1,22 @@
 #![allow(unused_parens)]
-use qprov::signatures::SecretKey;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Duration;
 use vpnmessaging::mio::net::UdpSocket;
-use vpnmessaging::{
-  compare_hashes, recv_all_parts_blocking, send_guaranteed, HelloMessage, KeyType, PlainMessage,
-};
 use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
+use vpnmessaging::{
+  receive_unreliable, recv_all_parts_blocking, send_guaranteed, send_unreliable, HelloMessage,
+  KeyType, MessagePartsCollection, PlainMessage,
+};
 
 use clap::Parser;
 use qprov::keys::CertificateChain;
 use qprov::{Certificate, SecKeyPair};
 use wintun::Adapter;
+
+use crate::transient_hashmap::TransientHashMap;
+pub mod transient_hashmap;
 
 pub fn certificate_verificator(_parent: &Certificate, _child: &Certificate) -> bool {
   true
@@ -32,7 +36,16 @@ fn main() {
   let chain = CertificateChain::from_file(&cli.certificate_chain_file).unwrap();
   let secret_key = SecKeyPair::from_file(cli.secret_key_file).unwrap();
 
-  let (ip, mask) = handshake(&mut socket, &secret_key, &ca_cert, &chain).unwrap();
+  let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
+
+  let (ip, mask, mut crypter) = handshake(
+    &mut socket,
+    &secret_key,
+    &ca_cert,
+    &chain,
+    buffer.as_mut_slice(),
+  )
+  .unwrap();
   println!("received ip: {ip}/{mask}");
 
   let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
@@ -47,46 +60,63 @@ fn main() {
   set_ip_address(&adapter, ip, mask).unwrap();
 
   println!("ip successfully set");
+
+  let mut poll = mio::Poll::new().unwrap();
+  let registry = poll.registry();
+  registry
+    .register(&mut socket, SOCK, mio::Interest::READABLE)
+    .unwrap();
+  let tun_waker = mio::Waker::new(registry, TUN).unwrap();
+  let mut events = mio::Events::with_capacity(1024);
+  let (tun_sender, tun_receiver) = std::sync::mpsc::channel();
+  let (sock_sender, sock_receiver): (std::sync::mpsc::Sender<Vec<u8>>, _) =
+    std::sync::mpsc::channel();
+
   //Specify the size of the ring buffer the wintun driver should use.
   let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
-  loop {}
-  // let mut poll = mio::Poll::new().unwrap();
-  // let registry = poll.registry();
-  // registry.register(&mut socket, SOCK, mio::Interest::READABLE);
-  // registry.register(&mut )
-  // let mut internal_ip_bytes = [0u8; 4];
-  // stream.read_exact(&mut internal_ip_bytes).unwrap();
-  // println!("received ip: {:?}", internal_ip_bytes);
-  // stream
-  //   .set_read_timeout(Some(std::time::Duration::from_millis(300)))
-  //   .unwrap();
-  // set_ip_address(&adapter, internal_ip_bytes).unwrap();
-  // println!("ip successfully set");
-  // //Specify the size of the ring buffer the wintun driver should use.
-  // let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
-  // loop {
-  //   if let Some(packet) = session.try_receive().unwrap() {
-  //     stream.write_sized(packet.bytes()).unwrap();
-  //   }
-  //   match stream.read_sized() {
-  //     Ok(packet_data) => {
-  //       let mut packet = session
-  //         .allocate_send_packet(packet_data.len() as u16)
-  //         .unwrap();
-  //       packet.bytes_mut().copy_from_slice(&packet_data);
-  //       //Send the packet to wintun virtual adapter for processing by the system
-  //       session.send_packet(packet);
-  //     }
-  //     Err(err) => {
-  //       if !matches!(
-  //         err.kind(),
-  //         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-  //       ) {
-  //         panic!("Error: {err:?}");
-  //       }
-  //     }
-  //   }
-  // }
+  std::thread::spawn(move || loop {
+    if let Some(packet) = session.try_receive().unwrap() {
+      tun_sender.send(packet.bytes().to_vec()).unwrap();
+      tun_waker.wake().unwrap();
+    }
+    for packet in sock_receiver.try_iter() {
+      let mut packet_send = session.allocate_send_packet(packet.len() as u16).unwrap();
+      packet_send.bytes_mut().copy_from_slice(&packet);
+      session.send_packet(packet_send);
+    }
+  });
+  let mut messages_map = TransientHashMap::new(Duration::from_secs(5));
+  loop {
+    messages_map.prune();
+    poll.poll(&mut events, None).unwrap();
+    for event in &events {
+      match event.token() {
+        SOCK => {
+          let parts = receive_unreliable(&mut socket, buffer.as_mut_slice());
+          for part in parts {
+            let id = part.id;
+            let messages = messages_map
+              .entry(id)
+              .or_insert_with(|| MessagePartsCollection::new(part.total));
+            let Ok(Some(PlainMessage::Encrypted(data))) = messages.add(part) else {
+              continue;
+            };
+            let Some(DecryptedMessage::IpPacket(packet)) = data.decrypt(&mut crypter) else {
+              continue;
+            };
+            sock_sender.send(packet).unwrap();
+          }
+        }
+        TUN => {
+          for packet in tun_receiver.try_iter() {
+            let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter);
+            drop(send_unreliable(&mut socket, message, buffer.as_mut_slice()));
+          }
+        }
+        _ => {}
+      }
+    }
+  }
 }
 
 fn handshake(
@@ -94,9 +124,8 @@ fn handshake(
   secret_key: &SecKeyPair,
   ca_cert: &Certificate,
   chain: &CertificateChain,
-) -> Result<(Ipv4Addr, u8), Box<dyn std::error::Error>> {
-  let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
-
+  buffer: &mut [u8],
+) -> Result<(Ipv4Addr, u8, ClientCrypter), Box<dyn std::error::Error>> {
   // ======== CLIENT HELLO
   let client_random = KeyType::generate();
   let client_hello = HelloMessage {
@@ -104,11 +133,11 @@ fn handshake(
     random: client_random,
   };
   let message = PlainMessage::Hello(client_hello.clone());
-  send_guaranteed(socket, message, buffer.as_mut_slice())?;
+  send_guaranteed(socket, message, buffer)?;
   // ======== !CLIENT HELLO
 
   // ======== SERVER HELLO
-  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let message = recv_all_parts_blocking(socket, buffer)?;
   let PlainMessage::Hello(server_hello) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
   };
@@ -124,11 +153,11 @@ fn handshake(
   let (encapsulated, server_premaster) =
     KeyType::encapsulate(&server_hello.chain.get_target().contents.pub_keys);
   let message = PlainMessage::Premaster(encapsulated);
-  send_guaranteed(socket, message, buffer.as_mut_slice())?;
+  send_guaranteed(socket, message, buffer)?;
   // ======== !SERVER PREMASTER
 
   // ======== CLIENT PREMASTER
-  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let message = recv_all_parts_blocking(socket, buffer)?;
   let PlainMessage::Premaster(encapsulated) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
   };
@@ -144,11 +173,11 @@ fn handshake(
 
   // ======== CLIENT READY
   let encrypted = DecryptedMessage::Ready { hash }.encrypt(&mut crypter);
-  send_guaranteed(socket, encrypted, buffer.as_mut_slice())?;
+  send_guaranteed(socket, encrypted, buffer)?;
   // ======== !CLIENT READY
 
   // ======== SERVER WELCOME
-  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let message = recv_all_parts_blocking(socket, buffer)?;
   let PlainMessage::Encrypted(encrypted) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")));
   };
@@ -160,7 +189,7 @@ fn handshake(
   };
   // ======== !SERVER WELCOME
 
-  Ok((ip, mask))
+  Ok((ip, mask, crypter))
 }
 
 fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: Ipv4Addr, mask: u8) -> std::io::Result<()> {
