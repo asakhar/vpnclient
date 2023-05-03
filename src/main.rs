@@ -1,69 +1,168 @@
 #![allow(unused_parens)]
-use std::io::{ErrorKind, Read};
+use qprov::signatures::SecretKey;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-
-use qprov::Certificate;
+use vpnmessaging::mio::net::UdpSocket;
+use vpnmessaging::{
+  compare_hashes, recv_all_parts_blocking, send_guaranteed, HelloMessage, KeyType, PlainMessage,
+};
+use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
 
 use clap::Parser;
-use qprov::sized_read_writes::{ReadSizedExt, WriteSizedExt};
-use qprov::{PqsChannel, PqsContext};
+use qprov::keys::CertificateChain;
+use qprov::{Certificate, SecKeyPair};
 use wintun::Adapter;
+
+pub fn certificate_verificator(_parent: &Certificate, _child: &Certificate) -> bool {
+  true
+}
+
+const SOCK: mio::Token = mio::Token(0);
+const TUN: mio::Token = mio::Token(1);
 
 fn main() {
   let cli = Cli::parse();
-  let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
-  let adapter = match Adapter::open(&wintun, &cli.iface_name) {
-    Ok(a) => a,
-    Err(_) => {
-      //If loading failed (most likely it didn't exist), create a new one
-      wintun::Adapter::create(&wintun, &cli.iface_pool, &cli.iface_name, None)
-        .expect("Failed to create wintun adapter!")
-    }
-  };
 
-  let stream = std::net::TcpStream::connect(&cli.server).unwrap();
-  stream
-    .set_read_timeout(Some(std::time::Duration::from_millis(1000)))
-    .unwrap();
+  let mut socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+    .expect("Failed to bind to address");
+  socket.connect(cli.server).unwrap();
+
   let ca_cert = Certificate::from_file(&cli.ca_certificate_file).unwrap();
-  let context = PqsContext::client(ca_cert);
-  let mut stream = PqsChannel::new(stream, &context).unwrap();
-  let mut internal_ip_bytes = [0u8; 4];
-  stream.read_exact(&mut internal_ip_bytes).unwrap();
-  println!("received ip: {:?}", internal_ip_bytes);
-  stream
-    .set_read_timeout(Some(std::time::Duration::from_millis(300)))
-    .unwrap();
+  let chain = CertificateChain::from_file(&cli.certificate_chain_file).unwrap();
+  let secret_key = SecKeyPair::from_file(cli.secret_key_file).unwrap();
 
-  set_ip_address(&adapter, internal_ip_bytes).unwrap();
-  println!("ip successfully set");
-  //Specify the size of the ring buffer the wintun driver should use.
-  let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+  let ip = handshake(&mut socket, &secret_key, &ca_cert, &chain).unwrap();
+  println!("received ip: {ip}");
 
-  loop {
-    if let Some(packet) = session.try_receive().unwrap() {
-      stream.write_sized(packet.bytes()).unwrap();
-    }
-    match stream.read_sized() {
-      Ok(packet_data) => {
-        let mut packet = session
-          .allocate_send_packet(packet_data.len() as u16)
-          .unwrap();
-        packet.bytes_mut().copy_from_slice(&packet_data);
+  // let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
+  // let adapter = match Adapter::open(&wintun, &cli.iface_name) {
+  //   Ok(a) => a,
+  //   Err(_) => {
+  //     //If loading failed (most likely it didn't exist), create a new one
+  //     wintun::Adapter::create(&wintun, &cli.iface_pool, &cli.iface_name, None)
+  //       .expect("Failed to create wintun adapter!")
+  //   }
+  // };
+  // set_ip_address(&adapter, internal_ip_bytes).unwrap();
+  // println!("ip successfully set");
+  // //Specify the size of the ring buffer the wintun driver should use.
+  // let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+  // let mut poll = mio::Poll::new().unwrap();
+  // let registry = poll.registry();
+  // registry.register(&mut socket, SOCK, mio::Interest::READABLE);
+  // registry.register(&mut )
+  // let mut internal_ip_bytes = [0u8; 4];
+  // stream.read_exact(&mut internal_ip_bytes).unwrap();
+  // println!("received ip: {:?}", internal_ip_bytes);
+  // stream
+  //   .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+  //   .unwrap();
+  // set_ip_address(&adapter, internal_ip_bytes).unwrap();
+  // println!("ip successfully set");
+  // //Specify the size of the ring buffer the wintun driver should use.
+  // let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+  // loop {
+  //   if let Some(packet) = session.try_receive().unwrap() {
+  //     stream.write_sized(packet.bytes()).unwrap();
+  //   }
+  //   match stream.read_sized() {
+  //     Ok(packet_data) => {
+  //       let mut packet = session
+  //         .allocate_send_packet(packet_data.len() as u16)
+  //         .unwrap();
+  //       packet.bytes_mut().copy_from_slice(&packet_data);
+  //       //Send the packet to wintun virtual adapter for processing by the system
+  //       session.send_packet(packet);
+  //     }
+  //     Err(err) => {
+  //       if !matches!(
+  //         err.kind(),
+  //         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+  //       ) {
+  //         panic!("Error: {err:?}");
+  //       }
+  //     }
+  //   }
+  // }
+}
 
-        //Send the packet to wintun virtual adapter for processing by the system
-        session.send_packet(packet);
-      }
-      Err(err) => {
-        if !matches!(
-          err.kind(),
-          std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ) {
-          panic!("Error: {err:?}");
-        }
-      }
-    }
+fn handshake(
+  socket: &mut UdpSocket,
+  secret_key: &SecKeyPair,
+  ca_cert: &Certificate,
+  chain: &CertificateChain,
+) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+  let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
+
+  // ======== CLIENT HELLO
+  let client_random = KeyType::generate();
+  let client_hello = HelloMessage {
+    chain: chain.clone(),
+    random: client_random,
+  };
+  let message = PlainMessage::Hello(client_hello.clone());
+  send_guaranteed(socket, message, buffer.as_mut_slice())?;
+  // ======== !CLIENT HELLO
+
+  // ======== SERVER HELLO
+  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let PlainMessage::Hello(server_hello) = message else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
+  };
+  // ======== !SERVER HELLO
+
+  // ======== PREMASTER
+  let (encapsulated, premaster) =
+    KeyType::encapsulate(&server_hello.chain.get_target().contents.pub_keys);
+  let message = PlainMessage::Premaster(encapsulated);
+  send_guaranteed(socket, message, buffer.as_mut_slice())?;
+  // ======== !PREMASTER
+
+  // ======== KEY DERIVATION
+  let derived_key = client_hello.random ^ server_hello.random ^ premaster;
+  let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(client_hello.random));
+  let expected_hash = KeyType::zero(); // TODO: compute hashes
+                                       // ======== !KEY DERIVATION
+
+  // ======== SERVER READY
+  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let PlainMessage::Ready(encrypted) = message else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during ready")));
+  };
+  let decrypted = encrypted
+    .decrypt(&mut crypter)
+    .expect("Failed to decrypt server hello");
+  let DecryptedMessage::Ready { hash } = decrypted else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during ready inside encrypted")))
+  };
+  if !compare_hashes(expected_hash, hash) {
+    return Err(Box::new(std::io::Error::new(
+      ErrorKind::InvalidData,
+      "Hashes did not match",
+    )));
   }
+  // ======== !SERVER READY
+
+  // ======== CLIENT READY
+  let encrypted = DecryptedMessage::Ready { hash }.encrypt(&mut crypter);
+  send_guaranteed(socket, encrypted, buffer.as_mut_slice())?;
+  // ======== !CLIENT READY
+
+  // ======== SERVER WELCOME
+  let message = recv_all_parts_blocking(socket, buffer.as_mut_slice())?;
+  let PlainMessage::Encrypted(encrypted) = message else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")));
+  };
+  let decrypted = encrypted
+    .decrypt(&mut crypter)
+    .expect("Failed to decrypt server hello");
+  let DecryptedMessage::Welcome{ip} = decrypted else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")))
+  };
+  // ======== !SERVER WELCOME
+
+  Ok(ip)
 }
 
 fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: [u8; 4]) -> std::io::Result<()> {
@@ -117,13 +216,17 @@ fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: [u8; 4]) -> std::io::Resu
 #[derive(Parser)]
 struct Cli {
   #[arg()]
-  server: String,
+  server: SocketAddr,
   #[arg(long, short, default_value_t = ("wintun/bin/amd64/wintun.dll".to_owned()))]
   libpath: String,
-  #[arg(long, short, default_value_t = ("Demo".to_owned()))]
+  #[arg(long, short = 'n', default_value_t = ("Demo".to_owned()))]
   iface_name: String,
-  #[arg(long, short, default_value_t = ("Example".to_owned()))]
+  #[arg(long, short = 'p', default_value_t = ("Example".to_owned()))]
   iface_pool: String,
-  #[arg(short, long, default_value_t = ("ca.cert".to_owned()))]
+  #[arg(long, short, default_value_t = ("client.key".to_owned()))]
+  secret_key_file: String,
+  #[arg(short, long, default_value_t = ("ca.crt".to_owned()))]
   ca_certificate_file: String,
+  #[arg(short = 'e', long, default_value_t = ("client.chn".to_owned()))]
+  certificate_chain_file: String,
 }
