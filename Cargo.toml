@@ -13,7 +13,6 @@ clap = { version = "4.1.13", features = ["derive"] }
 lazy_static = "1.4.0"
 mio-tun = { version = "0.1.0", path = "../mio-tun" }
 openssl = "0.10.45"
-qprov = { version = "0.1.0", path = "../qprov" }
 serde = { version = "1.0.160", features = ["derive"] }
 vpnmessaging = { version = "0.1.0", path = "../vpnmessaging" }
 

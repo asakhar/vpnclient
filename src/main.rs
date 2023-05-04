@@ -8,6 +8,7 @@ use vpnmessaging::{
   receive_unreliable, recv_all_parts_blocking, send_guaranteed, send_unreliable, HelloMessage,
   KeyType, MessagePartsCollection, PlainMessage,
 };
+use vpnmessaging::qprov;
 
 use clap::Parser;
 use qprov::keys::CertificateChain;
