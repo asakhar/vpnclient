@@ -1,7 +1,6 @@
 #![allow(unused_parens)]
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
 use std::time::Duration;
 use vpnmessaging::mio::net::UdpSocket;
 use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
@@ -13,7 +12,6 @@ use vpnmessaging::{
 use clap::Parser;
 use qprov::keys::CertificateChain;
 use qprov::{Certificate, SecKeyPair};
-use wintun::Adapter;
 
 use crate::transient_hashmap::TransientHashMap;
 pub mod transient_hashmap;
@@ -48,43 +46,20 @@ fn main() {
   .unwrap();
   println!("received ip: {ip}/{mask}");
 
-  let wintun = unsafe { wintun::load_from_path(cli.libpath) }.expect("Failed to load wintun dll");
-  let adapter = match Adapter::open(&wintun, &cli.iface_name) {
-    Ok(a) => a,
-    Err(_) => {
-      //If loading failed (most likely it didn't exist), create a new one
-      wintun::Adapter::create(&wintun, &cli.iface_pool, &cli.iface_name, None)
-        .expect("Failed to create wintun adapter!")
-    }
-  };
-  set_ip_address(&adapter, ip, mask).unwrap();
-
-  println!("ip successfully set");
+  let mut tun =
+    mio_tun::Tun::new_with_path(cli.libpath, cli.iface_name, cli.iface_pool, ip, mask).unwrap();
+  println!("Ip successfully set!");
 
   let mut poll = mio::Poll::new().unwrap();
   let registry = poll.registry();
   registry
     .register(&mut socket, SOCK, mio::Interest::READABLE)
     .unwrap();
-  let tun_waker = mio::Waker::new(registry, TUN).unwrap();
+  registry
+    .register(&mut tun, TUN, mio::Interest::READABLE)
+    .unwrap();
   let mut events = mio::Events::with_capacity(1024);
-  let (tun_sender, tun_receiver) = std::sync::mpsc::channel();
-  let (sock_sender, sock_receiver): (std::sync::mpsc::Sender<Vec<u8>>, _) =
-    std::sync::mpsc::channel();
 
-  //Specify the size of the ring buffer the wintun driver should use.
-  let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
-  std::thread::spawn(move || loop {
-    if let Some(packet) = session.try_receive().unwrap() {
-      tun_sender.send(packet.bytes().to_vec()).unwrap();
-      tun_waker.wake().unwrap();
-    }
-    for packet in sock_receiver.try_iter() {
-      let mut packet_send = session.allocate_send_packet(packet.len() as u16).unwrap();
-      packet_send.bytes_mut().copy_from_slice(&packet);
-      session.send_packet(packet_send);
-    }
-  });
   let mut messages_map = TransientHashMap::new(Duration::from_secs(5));
   loop {
     messages_map.prune();
@@ -104,11 +79,11 @@ fn main() {
             let Some(DecryptedMessage::IpPacket(packet)) = data.decrypt(&mut crypter) else {
               continue;
             };
-            sock_sender.send(packet).unwrap();
+            tun.send(packet);
           }
         }
         TUN => {
-          for packet in tun_receiver.try_iter() {
+          for packet in tun.iter() {
             let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter);
             drop(send_unreliable(&mut socket, message, buffer.as_mut_slice()));
           }
@@ -192,59 +167,11 @@ fn handshake(
   Ok((ip, mask, crypter))
 }
 
-fn set_ip_address(adapter: &Arc<Adapter>, internal_ip: Ipv4Addr, mask: u8) -> std::io::Result<()> {
-  let mut address_row = winapi::shared::netioapi::MIB_UNICASTIPADDRESS_ROW::default();
-  unsafe {
-    winapi::shared::netioapi::InitializeUnicastIpAddressEntry(&mut address_row as *mut _);
-  }
-  address_row.InterfaceLuid = winapi::shared::ifdef::NET_LUID_LH {
-    Value: adapter.get_luid(),
-  };
-  unsafe {
-    let ipv4 = address_row.Address.Ipv4_mut();
-    ipv4.sin_family = winapi::shared::ws2def::AF_INET as _;
-    *ipv4.sin_addr.S_un.S_addr_mut() = u32::from_ne_bytes(internal_ip.octets());
-  }
-  address_row.OnLinkPrefixLength = mask;
-  address_row.DadState = winapi::shared::nldef::IpDadStatePreferred;
-  let error =
-    unsafe { winapi::shared::netioapi::CreateUnicastIpAddressEntry(&mut address_row as *mut _) };
-  if error != winapi::shared::winerror::ERROR_SUCCESS {
-    return Err(std::io::Error::new(
-      ErrorKind::AddrNotAvailable,
-      format!(
-        "Failed to set IP address: {:?}",
-        get_last_error::Win32Error::new(error)
-      ),
-    ));
-  }
-  Ok(())
-}
-// //Write IPV4 version and header length
-// bytes[0] = 0x40;
-
-// //Finish writing IP header
-// bytes[9] = 0x69;
-// bytes[10] = 0x04;
-// bytes[11] = 0x20;
-// //...
-// loop {
-//   let mut line = String::new();
-//   std::io::stdin().read_line(&mut line).unwrap();
-//   stream.write_all(&line.len().to_be_bytes()).unwrap();
-//   stream.write_all(line.as_bytes()).unwrap();
-//   let mut buf = [0u8; std::mem::size_of::<usize>()];
-//   stream.read_exact(&mut buf).unwrap();
-//   let len = usize::from_be_bytes(buf);
-//   let mut line = vec![0u8; len];
-//   stream.read_exact(&mut line).unwrap();
-//   println!("-> {}", String::from_utf8(line).unwrap());
-// }
 #[derive(Parser)]
 struct Cli {
   #[arg()]
   server: SocketAddr,
-  #[arg(long, short, default_value_t = ("wintun/bin/amd64/wintun.dll".to_owned()))]
+  #[arg(long, short, default_value_t = ("./wintun.dll".to_owned()))]
   libpath: String,
   #[arg(long, short = 'n', default_value_t = ("Demo".to_owned()))]
   iface_name: String,
