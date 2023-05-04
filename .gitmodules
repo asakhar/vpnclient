@@ -1,0 +1,6 @@
+[submodule "vpnmessaging"]
+	path = vpnmessaging
+	url = git@github.com:asakhar/vpnmessaging.git
+[submodule "mio-tun"]
+	path = mio-tun
+	url = git@github.com:asakhar/mio-tun.git
