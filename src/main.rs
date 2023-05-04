@@ -24,6 +24,8 @@ pub fn certificate_verificator(_parent: &Certificate, _child: &Certificate) -> b
 const SOCK: mio::Token = mio::Token(0);
 const TUN: mio::Token = mio::Token(1);
 
+const BUF_SIZE: usize = 0x10000;
+
 fn main() {
   let cli = Cli::parse();
 
@@ -35,8 +37,8 @@ fn main() {
   let chain = CertificateChain::from_file(&cli.certificate_chain_file).unwrap();
   let secret_key = SecKeyPair::from_file(cli.secret_key_file).unwrap();
   let keep_alive_interval = Duration::from_secs(cli.keep_alive_interval);
-
-  let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
+  
+  let mut buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
 
   loop {
     let mut retries_count = 0;
