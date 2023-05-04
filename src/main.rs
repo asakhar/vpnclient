@@ -34,6 +34,7 @@ fn main() {
   let ca_cert = Certificate::from_file(&cli.ca_certificate_file).unwrap();
   let chain = CertificateChain::from_file(&cli.certificate_chain_file).unwrap();
   let secret_key = SecKeyPair::from_file(cli.secret_key_file).unwrap();
+  let keep_alive_interval = Duration::from_secs(cli.keep_alive_interval);
 
   let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
 
@@ -64,7 +65,11 @@ fn main() {
   let mut messages_map = TransientHashMap::new(Duration::from_secs(5));
   loop {
     messages_map.prune();
-    poll.poll(&mut events, None).unwrap();
+    poll.poll(&mut events, Some(keep_alive_interval)).unwrap();
+    if events.is_empty() {
+      let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter);
+      drop(send_unreliable(&mut socket, keep_alive, buffer.as_mut_slice()));
+    }
     for event in &events {
       match event.token() {
         SOCK => {
@@ -184,4 +189,6 @@ struct Cli {
   ca_certificate_file: String,
   #[arg(short = 'e', long, default_value_t = ("keys/client.chn".to_owned()))]
   certificate_chain_file: String,
+  #[arg(short, long, default_value_t = 1)]
+  keep_alive_interval: u64
 }
