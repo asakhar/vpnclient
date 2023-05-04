@@ -3,12 +3,12 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 use vpnmessaging::mio::net::UdpSocket;
+use vpnmessaging::qprov;
 use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
 use vpnmessaging::{
   receive_unreliable, recv_all_parts_blocking, send_guaranteed, send_unreliable, HelloMessage,
   KeyType, MessagePartsCollection, PlainMessage,
 };
-use vpnmessaging::qprov;
 
 use clap::Parser;
 use qprov::keys::CertificateChain;
@@ -38,77 +38,96 @@ fn main() {
 
   let mut buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
 
-  let (ip, mask, mut crypter) = handshake(
-    &mut socket,
-    &secret_key,
-    &ca_cert,
-    &chain,
-    buffer.as_mut_slice(),
-  )
-  .unwrap();
-  println!("received ip: {ip}/{mask}");
-
-  let mut tun =
-    mio_tun::Tun::new_with_path(cli.libpath, cli.iface_name, cli.iface_pool, ip, mask).unwrap();
-  println!("Ip successfully set!");
-
-  let mut poll = mio::Poll::new().unwrap();
-  let registry = poll.registry();
-  registry
-    .register(&mut socket, SOCK, mio::Interest::READABLE)
-    .unwrap();
-  registry
-    .register(&mut tun, TUN, mio::Interest::READABLE)
-    .unwrap();
-  let mut events = mio::Events::with_capacity(1024);
-
-  let mut messages_map = TransientHashMap::new(Duration::from_secs(5));
-  let mut last_keep_alive = Instant::now();
   loop {
-    messages_map.prune();
-    poll.poll(&mut events, Some(keep_alive_interval)).unwrap();
-    if events.is_empty() {
-      let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter);
-      drop(send_unreliable(&mut socket, keep_alive, buffer.as_mut_slice()));
-    }
-    for event in &events {
-      match event.token() {
-        SOCK => {
-          let parts = receive_unreliable(&mut socket, buffer.as_mut_slice());
-          for part in parts {
-            let id = part.id;
-            let messages = messages_map
-              .entry(id)
-              .or_insert_with(|| MessagePartsCollection::new(part.total));
-            let Ok(Some(PlainMessage::Encrypted(data))) = messages.add(part) else {
+    let mut retries_count = 0;
+    const MAX_ATTEMPTS: usize = 10;
+    let (ip, mask, mut crypter) = loop {
+      match handshake(
+        &mut socket,
+        &secret_key,
+        &ca_cert,
+        &chain,
+        buffer.as_mut_slice(),
+      ) {
+        Ok(res) => break res,
+        _ => {
+          if retries_count > MAX_ATTEMPTS {
+            eprintln!("Failed to connect");
+            return;
+          }
+          retries_count += 1;
+        }
+      }
+    };
+    println!("received ip: {ip}/{mask}");
+
+    let mut tun =
+      mio_tun::Tun::new_with_path(&cli.libpath, &cli.iface_name, &cli.iface_pool, ip, mask).unwrap();
+    println!("Ip successfully set!");
+
+    let mut poll = mio::Poll::new().unwrap();
+    let registry = poll.registry();
+    registry
+      .register(&mut socket, SOCK, mio::Interest::READABLE)
+      .unwrap();
+    registry
+      .register(&mut tun, TUN, mio::Interest::READABLE)
+      .unwrap();
+    let mut events = mio::Events::with_capacity(1024);
+
+    let mut messages_map = TransientHashMap::new(Duration::from_secs(5));
+    let mut last_keep_alive = Instant::now();
+    'inner: loop {
+      messages_map.prune();
+      poll.poll(&mut events, Some(keep_alive_interval)).unwrap();
+      if events.is_empty() {
+        let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter);
+        drop(send_unreliable(
+          &mut socket,
+          keep_alive,
+          buffer.as_mut_slice(),
+        ));
+      }
+      for event in &events {
+        match event.token() {
+          SOCK => {
+            let parts = receive_unreliable(&mut socket, buffer.as_mut_slice());
+            for part in parts {
+              let id = part.id;
+              let messages = messages_map
+                .entry(id)
+                .or_insert_with(|| MessagePartsCollection::new(part.total));
+              let Ok(Some(PlainMessage::Encrypted(data))) = messages.add(part) else {
               continue;
             };
-            let Some(decrypted) = data.decrypt(&mut crypter) else {
+              let Some(decrypted) = data.decrypt(&mut crypter) else {
               continue;
             };
-            if matches!(decrypted, DecryptedMessage::KeepAlive) {
-              last_keep_alive = Instant::now();
+              if matches!(decrypted, DecryptedMessage::KeepAlive) {
+                last_keep_alive = Instant::now();
+                continue;
+              }
+              let DecryptedMessage::IpPacket(packet) = decrypted else {
               continue;
+            };
+              tun.send(packet);
             }
-            let DecryptedMessage::IpPacket(packet) = decrypted else {
-              continue;
-            };
-            tun.send(packet);
           }
-        }
-        TUN => {
-          for packet in tun.iter() {
-            let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter);
-            drop(send_unreliable(&mut socket, message, buffer.as_mut_slice()));
+          TUN => {
+            for packet in tun.iter() {
+              let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter);
+              drop(send_unreliable(&mut socket, message, buffer.as_mut_slice()));
+            }
           }
+          _ => {}
         }
-        _ => {}
+      }
+      if Instant::now().duration_since(last_keep_alive) > Duration::from_secs(60) {
+        eprintln!("Lost connection. Reconnecting...");
+        break 'inner;
       }
     }
-    if Instant::now().duration_since(last_keep_alive) > Duration::from_secs(60) {
-      eprintln!("Lost connection");
-      return;
-    }
+    poll.registry().deregister(&mut socket).unwrap();
   }
 }
 
@@ -202,5 +221,5 @@ struct Cli {
   #[arg(short = 'e', long, default_value_t = ("keys/client.chn".to_owned()))]
   certificate_chain_file: String,
   #[arg(short, long, default_value_t = 1)]
-  keep_alive_interval: u64
+  keep_alive_interval: u64,
 }
