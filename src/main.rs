@@ -1,7 +1,7 @@
 #![allow(unused_parens)]
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vpnmessaging::mio::net::UdpSocket;
 use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
 use vpnmessaging::{
@@ -63,6 +63,7 @@ fn main() {
   let mut events = mio::Events::with_capacity(1024);
 
   let mut messages_map = TransientHashMap::new(Duration::from_secs(5));
+  let mut last_keep_alive = Instant::now();
   loop {
     messages_map.prune();
     poll.poll(&mut events, Some(keep_alive_interval)).unwrap();
@@ -82,7 +83,14 @@ fn main() {
             let Ok(Some(PlainMessage::Encrypted(data))) = messages.add(part) else {
               continue;
             };
-            let Some(DecryptedMessage::IpPacket(packet)) = data.decrypt(&mut crypter) else {
+            let Some(decrypted) = data.decrypt(&mut crypter) else {
+              continue;
+            };
+            if matches!(decrypted, DecryptedMessage::KeepAlive) {
+              last_keep_alive = Instant::now();
+              continue;
+            }
+            let DecryptedMessage::IpPacket(packet) = decrypted else {
               continue;
             };
             tun.send(packet);
@@ -96,6 +104,10 @@ fn main() {
         }
         _ => {}
       }
+    }
+    if Instant::now().duration_since(last_keep_alive) > Duration::from_secs(60) {
+      eprintln!("Lost connection");
+      return;
     }
   }
 }
