@@ -108,11 +108,11 @@ fn handshake(
     random: client_random,
   };
   let message = PlainMessage::Hello(client_hello.clone());
-  send_guaranteed(socket, message, buffer)?;
+  send_guaranteed(socket, message, buffer, Some(Duration::from_secs(3)))?;
   // ======== !CLIENT HELLO
 
   // ======== SERVER HELLO
-  let message = recv_all_parts_blocking(socket, buffer)?;
+  let message = recv_all_parts_blocking(socket, buffer, Some(Duration::from_secs(3)))?;
   let PlainMessage::Hello(server_hello) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
   };
@@ -128,11 +128,11 @@ fn handshake(
   let (encapsulated, server_premaster) =
     KeyType::encapsulate(&server_hello.chain.get_target().contents.pub_keys);
   let message = PlainMessage::Premaster(encapsulated);
-  send_guaranteed(socket, message, buffer)?;
+  send_guaranteed(socket, message, buffer, Some(Duration::from_secs(3)))?;
   // ======== !SERVER PREMASTER
 
   // ======== CLIENT PREMASTER
-  let message = recv_all_parts_blocking(socket, buffer)?;
+  let message = recv_all_parts_blocking(socket, buffer, Some(Duration::from_secs(3)))?;
   let PlainMessage::Premaster(encapsulated) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
   };
@@ -148,11 +148,11 @@ fn handshake(
 
   // ======== CLIENT READY
   let encrypted = DecryptedMessage::Ready { hash }.encrypt(&mut crypter);
-  send_guaranteed(socket, encrypted, buffer)?;
+  send_guaranteed(socket, encrypted, buffer, Some(Duration::from_secs(3)))?;
   // ======== !CLIENT READY
 
   // ======== SERVER WELCOME
-  let message = recv_all_parts_blocking(socket, buffer)?;
+  let message = recv_all_parts_blocking(socket, buffer, Some(Duration::from_secs(3)))?;
   let PlainMessage::Encrypted(encrypted) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")));
   };
