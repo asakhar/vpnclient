@@ -178,10 +178,10 @@ struct Cli {
   iface_name: String,
   #[arg(long, short = 'p', default_value_t = ("Example".to_owned()))]
   iface_pool: String,
-  #[arg(long, short, default_value_t = ("client.key".to_owned()))]
+  #[arg(long, short, default_value_t = ("keys/client.key".to_owned()))]
   secret_key_file: String,
-  #[arg(short, long, default_value_t = ("ca.crt".to_owned()))]
+  #[arg(short, long, default_value_t = ("keys/ca.crt".to_owned()))]
   ca_certificate_file: String,
-  #[arg(short = 'e', long, default_value_t = ("client.chn".to_owned()))]
+  #[arg(short = 'e', long, default_value_t = ("keys/client.chn".to_owned()))]
   certificate_chain_file: String,
 }

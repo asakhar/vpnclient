@@ -1,6 +1,5 @@
 /target
-ca.*
-client.*
+keys
 .vscode
 Cargo.lock
 wintun.dll
