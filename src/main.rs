@@ -11,8 +11,7 @@ use vpnmessaging::{
 };
 
 use clap::Parser;
-use qprov::keys::CertificateChain;
-use qprov::{Certificate, SecKeyPair};
+use qprov::{Certificate, SecKeyPair, CertificateChain, FileSerialize};
 
 use crate::transient_hashmap::TransientHashMap;
 pub mod transient_hashmap;
