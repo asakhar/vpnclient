@@ -3,7 +3,7 @@ use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
 use vpnmessaging::mio::net::UdpSocket;
-use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
+use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage, send_sized};
 use vpnmessaging::{qprov, DecryptedHandshakeMessage, HandshakeMessage, Uuid};
 use vpnmessaging::{
   receive_unreliable, send_unreliable, HelloMessage, KeyType, MessagePartsCollection,
@@ -140,17 +140,17 @@ fn handshake(
   ca_cert: &Certificate,
   chain: &CertificateChain,
 ) -> Result<(Uuid, Ipv4Addr, u8, ClientCrypter), Box<dyn std::error::Error>> {
-  let mut socket = TcpStream::connect(server)?;
+  let mut stream = TcpStream::connect(server)?;
   // ======== CLIENT HELLO
   let client_hello = HelloMessage::from(chain);
   let client_random = client_hello.random;
   let message = HandshakeMessage::Hello(client_hello);
-  bincode::serialize_into(&mut socket, &message)?;
-  socket.flush()?;
+  send_sized(&mut stream, message)?;
+  stream.flush()?;
   // ======== !CLIENT HELLO
 
   // ======== SERVER HELLO
-  let message = bincode::deserialize_from(&mut socket)?;
+  let message = bincode::deserialize_from(&mut stream)?;
   let HandshakeMessage::Hello(server_hello) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
   };
@@ -170,12 +170,12 @@ fn handshake(
   let (encapsulated, server_premaster) =
     KeyType::encapsulate(&server_chain.get_target().contents.pub_keys);
   let message = HandshakeMessage::Premaster(encapsulated);
-  bincode::serialize_into(&mut socket, &message)?;
-  socket.flush()?;
+  send_sized(&mut stream, message)?;
+  stream.flush()?;
   // ======== !SERVER PREMASTER
 
   // ======== CLIENT PREMASTER
-  let message = bincode::deserialize_from(&mut socket)?;
+  let message = bincode::deserialize_from(&mut stream)?;
   let HandshakeMessage::Premaster(encapsulated) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
   };
@@ -191,12 +191,12 @@ fn handshake(
 
   // ======== CLIENT READY
   let encrypted = DecryptedHandshakeMessage::Ready { hash }.encrypt(&mut crypter);
-  bincode::serialize_into(&mut socket, &encrypted)?;
-  socket.flush()?;
+  send_sized(&mut stream, encrypted)?;
+  stream.flush()?;
   // ======== !CLIENT READY
 
   // ======== SERVER WELCOME
-  let message = bincode::deserialize_from(&mut socket)?;
+  let message = bincode::deserialize_from(&mut stream)?;
   let HandshakeMessage::Ready(encrypted) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during welcome")));
   };
