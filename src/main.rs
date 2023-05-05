@@ -3,7 +3,7 @@ use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
 use vpnmessaging::mio::net::UdpSocket;
-use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage, send_sized};
+use vpnmessaging::{iv_from_hello, mio, send_sized, ClientCrypter, DecryptedMessage};
 use vpnmessaging::{qprov, DecryptedHandshakeMessage, HandshakeMessage, Uuid};
 use vpnmessaging::{
   receive_unreliable, send_unreliable, HelloMessage, KeyType, MessagePartsCollection,
@@ -168,7 +168,9 @@ fn handshake(
 
   // ======== SERVER PREMASTER
   let (encapsulated, server_premaster) =
-    KeyType::encapsulate(&server_chain.get_target().contents.pub_keys);
+    KeyType::encapsulate(&server_chain.get_target().contents.pub_keys).ok_or(
+      std::io::Error::new(ErrorKind::InvalidData, "Failed to encapsulte"),
+    )?;
   let message = HandshakeMessage::Premaster(encapsulated);
   send_sized(&mut stream, message)?;
   stream.flush()?;
@@ -179,7 +181,9 @@ fn handshake(
   let HandshakeMessage::Premaster(encapsulated) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
   };
-  let client_premaster = KeyType::decapsulate(secret_key, &encapsulated);
+  let client_premaster = KeyType::decapsulate(secret_key, &encapsulated).ok_or(
+    std::io::Error::new(ErrorKind::InvalidData, "Failed to decapsulate"),
+  )?;
   // ======== !CLIENT PREMASTER
 
   // ======== KEY DERIVATION
