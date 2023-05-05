@@ -1,17 +1,16 @@
 #![allow(unused_parens)]
-use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::io::{ErrorKind, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
 use vpnmessaging::mio::net::UdpSocket;
-use vpnmessaging::qprov;
 use vpnmessaging::{iv_from_hello, mio, ClientCrypter, DecryptedMessage};
+use vpnmessaging::{qprov, DecryptedHandshakeMessage, HandshakeMessage, Uuid};
 use vpnmessaging::{
-  receive_unreliable, recv_all_parts_blocking, send_guaranteed, send_unreliable, HelloMessage,
-  KeyType, MessagePartsCollection, PlainMessage,
+  receive_unreliable, send_unreliable, HelloMessage, KeyType, MessagePartsCollection,
 };
 
 use clap::Parser;
-use qprov::{Certificate, SecKeyPair, CertificateChain, FileSerialize};
+use qprov::{Certificate, CertificateChain, FileSerialize, SecKeyPair};
 
 use crate::transient_hashmap::TransientHashMap;
 pub mod transient_hashmap;
@@ -30,26 +29,25 @@ fn main() {
 
   let mut socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
     .expect("Failed to bind to address");
+  let mut server_tcp = cli.server;
+  server_tcp.set_port(cli.server_tcp_port);
+  if let Some(ip) = cli.override_server_tcp_ip {
+    server_tcp.set_ip(ip);
+  }
   socket.connect(cli.server).unwrap();
 
   let ca_cert = Certificate::from_file(&cli.ca_certificate_file).unwrap();
   let chain = CertificateChain::from_file(&cli.certificate_chain_file).unwrap();
   let secret_key = SecKeyPair::from_file(cli.secret_key_file).unwrap();
   let keep_alive_interval = Duration::from_secs(cli.keep_alive_interval);
-  
+
   let mut buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
 
   loop {
     let mut retries_count = 0;
     const MAX_ATTEMPTS: usize = 10;
-    let (ip, mask, mut crypter) = loop {
-      match handshake(
-        &mut socket,
-        &secret_key,
-        &ca_cert,
-        &chain,
-        buffer.as_mut_slice(),
-      ) {
+    let (id, ip, mask, mut crypter) = loop {
+      match handshake(server_tcp, &secret_key, &ca_cert, &chain) {
         Ok(res) => break res,
         _ => {
           if retries_count > MAX_ATTEMPTS {
@@ -63,7 +61,8 @@ fn main() {
     println!("received ip: {ip}/{mask}");
 
     let mut tun =
-      mio_tun::Tun::new_with_path(&cli.libpath, &cli.iface_name, &cli.iface_pool, ip, mask).unwrap();
+      mio_tun::Tun::new_with_path(&cli.libpath, &cli.iface_name, &cli.iface_pool, ip, mask)
+        .unwrap();
     println!("Ip successfully set!");
 
     let mut poll = mio::Poll::new().unwrap();
@@ -82,7 +81,7 @@ fn main() {
       messages_map.prune();
       poll.poll(&mut events, Some(keep_alive_interval)).unwrap();
       if events.is_empty() {
-        let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter);
+        let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter, id);
         drop(send_unreliable(
           &mut socket,
           keep_alive,
@@ -98,12 +97,15 @@ fn main() {
               let messages = messages_map
                 .entry(id)
                 .or_insert_with(|| MessagePartsCollection::new(part.total));
-              let Ok(Some(PlainMessage::Encrypted(data))) = messages.add(part) else {
-              continue;
-            };
+              let Ok(Some(data)) = messages.add(part) else {
+                continue;
+              };
               let Some(decrypted) = data.decrypt(&mut crypter) else {
-              continue;
-            };
+                continue;
+              };
+              if data.get_sender_id() != id {
+                continue;
+              }
               if matches!(decrypted, DecryptedMessage::KeepAlive) {
                 last_keep_alive = Instant::now();
                 continue;
@@ -116,7 +118,7 @@ fn main() {
           }
           TUN => {
             for packet in tun.iter() {
-              let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter);
+              let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter, id);
               drop(send_unreliable(&mut socket, message, buffer.as_mut_slice()));
             }
           }
@@ -133,28 +135,30 @@ fn main() {
 }
 
 fn handshake(
-  socket: &mut UdpSocket,
+  server: SocketAddr,
   secret_key: &SecKeyPair,
   ca_cert: &Certificate,
   chain: &CertificateChain,
-  buffer: &mut [u8],
-) -> Result<(Ipv4Addr, u8, ClientCrypter), Box<dyn std::error::Error>> {
+) -> Result<(Uuid, Ipv4Addr, u8, ClientCrypter), Box<dyn std::error::Error>> {
+  let mut socket = TcpStream::connect(server)?;
   // ======== CLIENT HELLO
-  let client_random = KeyType::generate();
-  let client_hello = HelloMessage {
-    chain: chain.clone(),
-    random: client_random,
-  };
-  let message = PlainMessage::Hello(client_hello.clone());
-  send_guaranteed(socket, message, buffer, Some(Duration::from_secs(3)))?;
+  let client_hello = HelloMessage::from(chain);
+  let client_random = client_hello.random;
+  let message = HandshakeMessage::Hello(client_hello);
+  bincode::serialize_into(&mut socket, &message)?;
+  socket.flush()?;
   // ======== !CLIENT HELLO
 
   // ======== SERVER HELLO
-  let message = recv_all_parts_blocking(socket, buffer, Some(Duration::from_secs(3)))?;
-  let PlainMessage::Hello(server_hello) = message else {
+  let message = bincode::deserialize_from(&mut socket)?;
+  let HandshakeMessage::Hello(server_hello) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
   };
-  if !server_hello.chain.verify(&ca_cert, certificate_verificator) {
+  let server_chain = server_hello.chain().ok_or(std::io::Error::new(
+    ErrorKind::InvalidData,
+    "Server sent invalid certificate chain",
+  ))?;
+  if !server_chain.verify(&ca_cert, certificate_verificator) {
     return Err(Box::new(std::io::Error::new(
       ErrorKind::InvalidInput,
       "Failed to authorize servers certificate",
@@ -164,51 +168,58 @@ fn handshake(
 
   // ======== SERVER PREMASTER
   let (encapsulated, server_premaster) =
-    KeyType::encapsulate(&server_hello.chain.get_target().contents.pub_keys);
-  let message = PlainMessage::Premaster(encapsulated);
-  send_guaranteed(socket, message, buffer, Some(Duration::from_secs(3)))?;
+    KeyType::encapsulate(&server_chain.get_target().contents.pub_keys);
+  let message = HandshakeMessage::Premaster(encapsulated);
+  bincode::serialize_into(&mut socket, &message)?;
+  socket.flush()?;
   // ======== !SERVER PREMASTER
 
   // ======== CLIENT PREMASTER
-  let message = recv_all_parts_blocking(socket, buffer, Some(Duration::from_secs(3)))?;
-  let PlainMessage::Premaster(encapsulated) = message else {
+  let message = bincode::deserialize_from(&mut socket)?;
+  let HandshakeMessage::Premaster(encapsulated) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
   };
   let client_premaster = KeyType::decapsulate(secret_key, &encapsulated);
   // ======== !CLIENT PREMASTER
 
   // ======== KEY DERIVATION
-  let derived_key = client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
+  let derived_key = client_random ^ server_hello.random ^ server_premaster ^ client_premaster;
   let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_hello.random));
   let hash = KeyType::zero(); // TODO: compute hashes
 
   // ======== !KEY DERIVATION
 
   // ======== CLIENT READY
-  let encrypted = DecryptedMessage::Ready { hash }.encrypt(&mut crypter);
-  send_guaranteed(socket, encrypted, buffer, Some(Duration::from_secs(3)))?;
+  let encrypted = DecryptedHandshakeMessage::Ready { hash }.encrypt(&mut crypter);
+  bincode::serialize_into(&mut socket, &encrypted)?;
+  socket.flush()?;
   // ======== !CLIENT READY
 
   // ======== SERVER WELCOME
-  let message = recv_all_parts_blocking(socket, buffer, Some(Duration::from_secs(3)))?;
-  let PlainMessage::Encrypted(encrypted) = message else {
-    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")));
+  let message = bincode::deserialize_from(&mut socket)?;
+  let HandshakeMessage::Ready(encrypted) = message else {
+    return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during welcome")));
   };
-  let decrypted = encrypted
-    .decrypt(&mut crypter)
-    .expect("Failed to decrypt server hello");
-  let DecryptedMessage::Welcome{ip, mask} = decrypted else {
+  let decrypted = encrypted.decrypt(&mut crypter).ok_or(std::io::Error::new(
+    ErrorKind::InvalidData,
+    "Failed to decrypt server hello",
+  ))?;
+  let DecryptedHandshakeMessage::Welcome{ip, mask, id} = decrypted else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message")))
   };
   // ======== !SERVER WELCOME
 
-  Ok((ip, mask, crypter))
+  Ok((id, ip, mask, crypter))
 }
 
 #[derive(Parser)]
 struct Cli {
   #[arg()]
   server: SocketAddr,
+  #[arg(default_value_t = 9010)]
+  server_tcp_port: u16,
+  #[arg(long, short, required(false))]
+  override_server_tcp_ip: Option<IpAddr>,
   #[arg(long, short, default_value_t = ("./wintun.dll".to_owned()))]
   libpath: String,
   #[arg(long, short = 'n', default_value_t = ("Demo".to_owned()))]
