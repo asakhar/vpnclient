@@ -107,7 +107,6 @@ fn main() {
                 continue;
               };
               if matches!(decrypted, DecryptedMessage::KeepAlive) {
-                println!("received keep alive");
                 last_keep_alive = Instant::now();
                 continue;
               }
