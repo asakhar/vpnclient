@@ -140,7 +140,8 @@ fn handshake(
   ca_cert: &Certificate,
   chain: &CertificateChain,
 ) -> Result<(Uuid, Ipv4Addr, u8, ClientCrypter), Box<dyn std::error::Error>> {
-  let mut stream = TcpStream::connect(server)?;
+  let stream = TcpStream::connect(server)?;
+  let mut stream = std::io::BufWriter::new(stream);
   // ======== CLIENT HELLO
   let client_hello = HelloMessage::from(chain);
   let client_random = client_hello.random;
@@ -150,7 +151,7 @@ fn handshake(
   // ======== !CLIENT HELLO
 
   // ======== SERVER HELLO
-  let message = bincode::deserialize_from(&mut stream)?;
+  let message = bincode::deserialize_from(stream.get_mut())?;
   let HandshakeMessage::Hello(server_hello) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during hello")));
   };
@@ -177,7 +178,7 @@ fn handshake(
   // ======== !SERVER PREMASTER
 
   // ======== CLIENT PREMASTER
-  let message = bincode::deserialize_from(&mut stream)?;
+  let message = bincode::deserialize_from(stream.get_mut())?;
   let HandshakeMessage::Premaster(encapsulated) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during client premaster")));
   };
@@ -200,7 +201,7 @@ fn handshake(
   // ======== !CLIENT READY
 
   // ======== SERVER WELCOME
-  let message = bincode::deserialize_from(&mut stream)?;
+  let message = bincode::deserialize_from(stream.get_mut())?;
   let HandshakeMessage::Ready(encrypted) = message else {
     return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Server sent invalid message during welcome")));
   };
