@@ -46,7 +46,7 @@ fn main() {
   loop {
     let mut retries_count = 0;
     const MAX_ATTEMPTS: usize = 10;
-    let (id, ip, mask, mut crypter) = loop {
+    let (client_id, ip, mask, mut crypter) = loop {
       match handshake(server_tcp, &secret_key, &ca_cert, &chain) {
         Ok(res) => break res,
         _ => {
@@ -81,7 +81,7 @@ fn main() {
       messages_map.prune();
       poll.poll(&mut events, Some(keep_alive_interval)).unwrap();
       if events.is_empty() {
-        let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter, id);
+        let keep_alive = DecryptedMessage::KeepAlive.encrypt(&mut crypter, client_id);
         drop(send_unreliable(
           &mut socket,
           keep_alive,
@@ -100,13 +100,14 @@ fn main() {
               let Ok(Some(data)) = messages.add(part) else {
                 continue;
               };
+              if data.get_sender_id() != client_id {
+                continue;
+              }
               let Some(decrypted) = data.decrypt(&mut crypter) else {
                 continue;
               };
-              if data.get_sender_id() != id {
-                continue;
-              }
               if matches!(decrypted, DecryptedMessage::KeepAlive) {
+                println!("received keep alive");
                 last_keep_alive = Instant::now();
                 continue;
               }
@@ -118,7 +119,7 @@ fn main() {
           }
           TUN => {
             for packet in tun.iter() {
-              let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter, id);
+              let message = DecryptedMessage::IpPacket(packet).encrypt(&mut crypter, client_id);
               drop(send_unreliable(&mut socket, message, buffer.as_mut_slice()));
             }
           }
