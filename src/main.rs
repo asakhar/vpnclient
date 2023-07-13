@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use vpnclient::handshake;
 use vpnmessaging::mio::net::UdpSocket;
 use vpnmessaging::{mio, DecryptedMessage};
-use vpnmessaging::{qprov};
+use vpnmessaging::qprov;
 use vpnmessaging::{
   receive_unreliable, send_unreliable, MessagePartsCollection,
 };
@@ -56,7 +56,7 @@ fn main() {
     println!("received ip: {ip}/{mask}");
 
     let mut tun =
-      mio_tun::Tun::new_with_path(&cli.libpath, &cli.iface_name, &cli.iface_pool, ip, mask)
+      mio_tun::Tun::new(&cli.iface_name, &cli.iface_pool, ip, mask)
         .unwrap();
     println!("Ip successfully set!");
 
@@ -137,8 +137,6 @@ struct Cli {
   server_tcp_port: u16,
   #[arg(long, short, required(false))]
   override_server_tcp_ip: Option<IpAddr>,
-  #[arg(long, short, default_value_t = ("./wintun.dll".to_owned()))]
-  libpath: String,
   #[arg(long, short = 'n', default_value_t = ("Demo".to_owned()))]
   iface_name: String,
   #[arg(long, short = 'p', default_value_t = ("Example".to_owned()))]
